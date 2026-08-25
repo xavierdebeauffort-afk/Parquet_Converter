@@ -1,6 +1,10 @@
+[server]
+maxUploadSize = 600
+
+# Luminus internal tools — light theme
 [theme]
-primaryColor = "#00B612"
-backgroundColor = "#FAFAFA"
+primaryColor             = "#00B612"
+backgroundColor          = "#FAFAFA"
 secondaryBackgroundColor = "#F0F4F0"
-textColor = "#1F2937"
-font = "sans serif"
+textColor                = "#1F2937"
+font                     = "sans serif"
