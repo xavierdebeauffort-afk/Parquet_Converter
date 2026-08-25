@@ -5,6 +5,7 @@ import pandas as pd
 
 MAX_MB = 50
 _BYTES = MAX_MB * 1024 * 1024
+MAX_EXCEL_ROWS = 500_000  # openpyxl is too slow above this; Excel hard limit is ~1M
 
 st.set_page_config(page_title="Parquet Converter | Luminus", page_icon="📦", layout="wide")
 st.title("Parquet → Excel / CSV Converter")
@@ -57,13 +58,17 @@ if len(files) == 1:
     size_mb = len(raw) / 1024 / 1024
 
     # Load data; for oversized files keep full frame for metrics, slice after slicer inputs
-    if size_mb > MAX_MB:
-        df_full = pd.read_parquet(io.BytesIO(raw))
-        n_total = len(df_full)
-        all_cols_full = df_full.columns.tolist()
-    else:
-        df = pd.read_parquet(io.BytesIO(raw))
-        df_full = None
+    try:
+        if size_mb > MAX_MB:
+            df_full = pd.read_parquet(io.BytesIO(raw))
+            n_total = len(df_full)
+            all_cols_full = df_full.columns.tolist()
+        else:
+            df = pd.read_parquet(io.BytesIO(raw))
+            df_full = None
+    except Exception as e:
+        st.error(f"Could not read parquet file: {e}")
+        st.stop()
 
     # File metrics
     disp_rows = n_total if df_full is not None else len(df)
@@ -72,6 +77,8 @@ if len(files) == 1:
     m1.metric("Rows", f"{disp_rows:,}")
     m2.metric("Columns", str(disp_cols))
     m3.metric("File size", _size_label(len(raw)))
+    if size_mb > MAX_MB:
+        st.info(f"Large file — estimated memory usage: ~{size_mb * 4:.0f} MB (Streamlit Cloud limit ~1 GB)")
 
     st.divider()
 
@@ -123,32 +130,46 @@ if len(files) == 1:
 
     st.divider()
 
+    too_large_for_excel = len(df_out) > MAX_EXCEL_ROWS
+    if too_large_for_excel:
+        st.warning(f"File has {len(df_out):,} rows — Excel skipped (limit ~500k rows). CSV only.")
+
     # Convert + downloads
     if st.button("Convert", type="primary", use_container_width=True):
-        bar = st.progress(0, text="Writing Excel...")
-        excel_bytes = _to_excel({stem: df_out})
-        bar.progress(80, text="Writing CSV...")
+        bar = st.progress(0, text="Writing CSV...")
         csv_bytes = _to_csv(df_out)
-        bar.progress(100, text="Ready.")
-        st.session_state[f"_pq_{fhash}_excel"] = excel_bytes
         st.session_state[f"_pq_{fhash}_csv"] = csv_bytes
+        if not too_large_for_excel:
+            bar.progress(20, text="Writing Excel...")
+            excel_bytes = _to_excel({stem: df_out})
+            st.session_state[f"_pq_{fhash}_excel"] = excel_bytes
+        bar.progress(100, text="Ready.")
 
-    if f"_pq_{fhash}_excel" in st.session_state:
+    if f"_pq_{fhash}_csv" in st.session_state:
         c1, c2 = st.columns(2)
-        c1.download_button(
-            "⬇ Download Excel (.xlsx)",
-            data=st.session_state[f"_pq_{fhash}_excel"],
-            file_name=f"{stem}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-        c2.download_button(
-            "⬇ Download CSV (.csv)",
-            data=st.session_state[f"_pq_{fhash}_csv"],
-            file_name=f"{stem}.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
+        if not too_large_for_excel and f"_pq_{fhash}_excel" in st.session_state:
+            c1.download_button(
+                "⬇ Download Excel (.xlsx)",
+                data=st.session_state[f"_pq_{fhash}_excel"],
+                file_name=f"{stem}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+            c2.download_button(
+                "⬇ Download CSV (.csv)",
+                data=st.session_state[f"_pq_{fhash}_csv"],
+                file_name=f"{stem}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        else:
+            st.download_button(
+                "⬇ Download CSV (.csv)",
+                data=st.session_state[f"_pq_{fhash}_csv"],
+                file_name=f"{stem}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
 
 
 # ── batch mode ────────────────────────────────────────────────────────────────
@@ -159,17 +180,24 @@ else:
     # ── Main: per-file expanders ──────────────────────────────────────────────
     st.subheader(f"Batch mode — {len(files)} files")
 
-    for f in files:
+    for idx, f in enumerate(files):
         stem = _stem(f.name)
         raw = f.getvalue()
+        # idx prefix prevents DuplicateWidgetID when two files share the same stem
+        slot = f"{idx}_{stem}"
 
         with st.expander(f"{f.name}  ({_size_label(len(raw))})"):
             if len(raw) > _BYTES:
                 st.error(f"Exceeds {MAX_MB} MB limit. Upload this file alone to use the row slicer.")
-                frames[stem] = None
+                frames[slot] = None
                 continue
 
-            df = pd.read_parquet(io.BytesIO(raw))
+            try:
+                df = pd.read_parquet(io.BytesIO(raw))
+            except Exception as e:
+                st.error(f"Could not read file: {e}")
+                frames[slot] = None
+                continue
             cols = df.columns.tolist()
 
             m1, m2, m3 = st.columns(3)
@@ -177,39 +205,45 @@ else:
             m2.metric("Cols", str(len(cols)))
             m3.metric("Size", _size_label(len(raw)))
 
-            sel_key = f"b_{stem}"
+            sel_key = f"b_{slot}"
             if sel_key not in st.session_state:
                 st.session_state[sel_key] = cols
 
             st.caption(f"**Columns** ({len(st.session_state[sel_key])} of {len(cols)} selected)")
             b1, b2 = st.columns(2)
-            if b1.button("Select all", use_container_width=True, key=f"all_b_{stem}"):
+            if b1.button("Select all", use_container_width=True, key=f"all_b_{slot}"):
                 st.session_state[sel_key] = cols
                 st.rerun()
-            if b2.button("Deselect all", use_container_width=True, key=f"none_b_{stem}"):
+            if b2.button("Deselect all", use_container_width=True, key=f"none_b_{slot}"):
                 st.session_state[sel_key] = []
                 st.rerun()
 
             sel = st.multiselect("Columns", cols, key=sel_key, label_visibility="collapsed")
-            frames[stem] = df[sel] if sel else None
+            frames[slot] = df[sel] if sel else None
 
     valid = {k: v for k, v in frames.items() if v is not None}
 
     if not valid:
         st.stop()
 
+    excel_safe = {k: v for k, v in valid.items() if len(v) <= MAX_EXCEL_ROWS}
+    csv_only_keys = [k for k in valid if k not in excel_safe]
+    if csv_only_keys:
+        st.warning(f"Excluded from Excel (>500k rows, CSV only): {', '.join(csv_only_keys)}")
+
     st.divider()
     if st.button("Convert all", type="primary", use_container_width=True):
+        st.session_state.pop("_pq_batch_excel", None)
         bar = st.progress(0, text="Starting...")
         for i, name in enumerate(valid):
-            bar.progress(int((i + 1) / len(valid) * 80), text=f"Preparing {name}...")
-        bar.progress(85, text="Writing Excel...")
-        excel_bytes = _to_excel(valid)
-        bar.progress(95, text="Writing CSVs...")
+            bar.progress(int((i + 1) / len(valid) * 70), text=f"Preparing {name}...")
+        bar.progress(75, text="Writing CSVs...")
         csv_map = {name: _to_csv(df) for name, df in valid.items()}
-        bar.progress(100, text="Ready.")
-        st.session_state["_pq_batch_excel"] = excel_bytes
         st.session_state["_pq_batch_csvs"] = csv_map
+        if excel_safe:
+            bar.progress(85, text="Writing Excel...")
+            st.session_state["_pq_batch_excel"] = _to_excel(excel_safe)
+        bar.progress(100, text="Ready.")
 
     if "_pq_batch_excel" in st.session_state:
         st.download_button(
