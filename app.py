@@ -2,6 +2,7 @@ import hashlib
 import io
 import streamlit as st
 import pandas as pd
+import pyarrow.parquet as pq
 
 MAX_MB = 50
 _BYTES = MAX_MB * 1024 * 1024
@@ -35,6 +36,27 @@ def _size_label(n_bytes: int) -> str:
     return f"{n_bytes / 1024 / 1024:.1f} MB" if n_bytes >= 1024 * 1024 else f"{n_bytes / 1024:.0f} KB"
 
 
+@st.cache_data(show_spinner="Reading file metadata...")
+def _read_metadata(raw: bytes) -> tuple:
+    # reads schema + row count only — zero column data loaded into memory
+    pf = pq.ParquetFile(io.BytesIO(raw))
+    schema = pf.schema_arrow
+    return pf.metadata.num_rows, schema.names, [str(t) for t in schema.types]
+
+
+@st.cache_data(show_spinner="Loading selected columns...")
+def _read_columns(raw: bytes, columns: tuple) -> pd.DataFrame:
+    # columns is a tuple so @st.cache_data can hash it
+    return pq.read_table(io.BytesIO(raw), columns=list(columns)).to_pandas()
+
+
+@st.cache_data(show_spinner=False)
+def _read_preview(raw: bytes, columns: tuple) -> pd.DataFrame:
+    # reads first row group only — much cheaper than loading the full file
+    pf = pq.ParquetFile(io.BytesIO(raw))
+    return pf.read_row_group(0, columns=list(columns)).to_pandas().head(10)
+
+
 # ── upload ────────────────────────────────────────────────────────────────────
 
 files = st.file_uploader(
@@ -57,46 +79,37 @@ if len(files) == 1:
     fhash = hashlib.md5(raw).hexdigest()[:8]
     size_mb = len(raw) / 1024 / 1024
 
-    # Load data; for oversized files keep full frame for metrics, slice after slicer inputs
+    # Read schema + row count only — no column data loaded yet
     try:
-        if size_mb > MAX_MB:
-            df_full = pd.read_parquet(io.BytesIO(raw))
-            n_total = len(df_full)
-            all_cols_full = df_full.columns.tolist()
-        else:
-            df = pd.read_parquet(io.BytesIO(raw))
-            df_full = None
+        n_total, all_cols, _ = _read_metadata(raw)
     except Exception as e:
         st.error(f"Could not read parquet file: {e}")
         st.stop()
 
-    # File metrics
-    disp_rows = n_total if df_full is not None else len(df)
-    disp_cols = len(all_cols_full) if df_full is not None else len(df.columns)
     m1, m2, m3 = st.columns(3)
-    m1.metric("Rows", f"{disp_rows:,}")
-    m2.metric("Columns", str(disp_cols))
+    m1.metric("Rows", f"{n_total:,}")
+    m2.metric("Columns", str(len(all_cols)))
     m3.metric("File size", _size_label(len(raw)))
     if size_mb > MAX_MB:
-        st.info(f"Large file — estimated memory usage: ~{size_mb * 4:.0f} MB (Streamlit Cloud limit ~1 GB)")
+        st.info(f"Large file — estimated full load: ~{size_mb * 4:.0f} MB. Select only the columns you need below.")
 
     st.divider()
 
-    # Row slicer — only when file exceeds limit
-    if df_full is not None:
-        st.warning(f"File exceeds {MAX_MB} MB — select a row range to export a subset.")
+    # Row slicer for large files
+    if size_mb > MAX_MB:
+        st.warning(f"File exceeds {MAX_MB} MB — select a row range to limit memory usage.")
         c1, c2 = st.columns(2)
         r0 = int(c1.number_input("Start row", 0, n_total - 1, 0, step=1_000))
         r1 = int(c2.number_input("End row", 1, n_total, min(50_000, n_total), step=1_000))
         if r0 >= r1:
             st.error("Start row must be less than end row.")
             st.stop()
-        df = df_full.iloc[r0:r1].copy()
         st.caption(f"Slice: rows {r0:,} – {r1:,} ({r1 - r0:,} rows)")
         st.divider()
+    else:
+        r0, r1 = 0, n_total
 
-    # Column selector with Select all / Deselect all
-    all_cols = df.columns.tolist()
+    # Column selector — no data loaded until Convert is clicked
     sel_key = f"sel_{fhash}"
     if sel_key not in st.session_state:
         st.session_state[sel_key] = all_cols
@@ -121,29 +134,45 @@ if len(files) == 1:
         st.warning("Select at least one column.")
         st.stop()
 
+    # Estimated memory after column selection
+    sel_frac = len(selected) / len(all_cols)
+    row_frac = (r1 - r0) / n_total if n_total > 0 else 1.0
+    est_mb = size_mb * 4 * sel_frac * row_frac
+    if est_mb > 400:
+        st.warning(f"Estimated memory for this selection: ~{est_mb:.0f} MB — may be slow on Streamlit Cloud free tier.")
+
     st.divider()
 
-    # Preview
-    df_out = df[selected]
-    st.dataframe(df_out.head(5), use_container_width=True)
-    st.caption(f"Preview: first 5 of {len(df_out):,} rows × {len(selected)} columns")
+    # Preview — reads first row group of selected columns only
+    try:
+        preview_df = _read_preview(raw, tuple(selected))
+        st.dataframe(preview_df, use_container_width=True)
+        st.caption(f"Preview: first 10 of {r1 - r0:,} rows × {len(selected)} columns")
+    except Exception:
+        st.caption("Preview unavailable for this file.")
 
     st.divider()
 
-    too_large_for_excel = len(df_out) > MAX_EXCEL_ROWS
+    n_out = r1 - r0
+    too_large_for_excel = n_out > MAX_EXCEL_ROWS
     if too_large_for_excel:
-        st.warning(f"File has {len(df_out):,} rows — Excel skipped (limit ~500k rows). CSV only.")
+        st.warning(f"Row range has {n_out:,} rows — Excel skipped (limit ~500k rows). CSV only.")
 
-    # Convert + downloads
+    # Data is only loaded here, not before
     if st.button("Convert", type="primary", use_container_width=True):
-        bar = st.progress(0, text="Writing CSV...")
-        csv_bytes = _to_csv(df_out)
-        st.session_state[f"_pq_{fhash}_csv"] = csv_bytes
-        if not too_large_for_excel:
-            bar.progress(20, text="Writing Excel...")
-            excel_bytes = _to_excel({stem: df_out})
-            st.session_state[f"_pq_{fhash}_excel"] = excel_bytes
-        bar.progress(100, text="Ready.")
+        try:
+            bar = st.progress(0, text="Loading selected columns...")
+            df_out = _read_columns(raw, tuple(selected))
+            if r0 > 0 or r1 < n_total:
+                df_out = df_out.iloc[r0:r1].reset_index(drop=True)
+            bar.progress(50, text="Writing CSV...")
+            st.session_state[f"_pq_{fhash}_csv"] = _to_csv(df_out)
+            if not too_large_for_excel:
+                bar.progress(70, text="Writing Excel...")
+                st.session_state[f"_pq_{fhash}_excel"] = _to_excel({stem: df_out})
+            bar.progress(100, text="Ready.")
+        except Exception as e:
+            st.error(f"Conversion failed: {e}")
 
     if f"_pq_{fhash}_csv" in st.session_state:
         c1, c2 = st.columns(2)
@@ -175,9 +204,10 @@ if len(files) == 1:
 # ── batch mode ────────────────────────────────────────────────────────────────
 
 else:
-    frames = {}
+    # file_selections: slot → (raw_bytes, selected_cols_tuple, n_rows)
+    # DataFrames are NOT loaded during the expander loop — only at Convert time
+    file_selections = {}
 
-    # ── Main: per-file expanders ──────────────────────────────────────────────
     st.subheader(f"Batch mode — {len(files)} files")
 
     for idx, f in enumerate(files):
@@ -189,61 +219,66 @@ else:
         with st.expander(f"{f.name}  ({_size_label(len(raw))})"):
             if len(raw) > _BYTES:
                 st.error(f"Exceeds {MAX_MB} MB limit. Upload this file alone to use the row slicer.")
-                frames[slot] = None
                 continue
 
             try:
-                df = pd.read_parquet(io.BytesIO(raw))
+                n_rows, col_names, _ = _read_metadata(raw)
             except Exception as e:
                 st.error(f"Could not read file: {e}")
-                frames[slot] = None
                 continue
-            cols = df.columns.tolist()
 
             m1, m2, m3 = st.columns(3)
-            m1.metric("Rows", f"{len(df):,}")
-            m2.metric("Cols", str(len(cols)))
+            m1.metric("Rows", f"{n_rows:,}")
+            m2.metric("Cols", str(len(col_names)))
             m3.metric("Size", _size_label(len(raw)))
 
             sel_key = f"b_{slot}"
             if sel_key not in st.session_state:
-                st.session_state[sel_key] = cols
+                st.session_state[sel_key] = col_names
 
-            st.caption(f"**Columns** ({len(st.session_state[sel_key])} of {len(cols)} selected)")
+            st.caption(f"**Columns** ({len(st.session_state[sel_key])} of {len(col_names)} selected)")
             b1, b2 = st.columns(2)
             if b1.button("Select all", use_container_width=True, key=f"all_b_{slot}"):
-                st.session_state[sel_key] = cols
+                st.session_state[sel_key] = col_names
                 st.rerun()
             if b2.button("Deselect all", use_container_width=True, key=f"none_b_{slot}"):
                 st.session_state[sel_key] = []
                 st.rerun()
 
-            sel = st.multiselect("Columns", cols, key=sel_key, label_visibility="collapsed")
-            frames[slot] = df[sel] if sel else None
+            sel = st.multiselect("Columns", col_names, key=sel_key, label_visibility="collapsed")
+            if sel:
+                file_selections[slot] = (raw, tuple(sel), n_rows)
 
-    valid = {k: v for k, v in frames.items() if v is not None}
-
-    if not valid:
+    if not file_selections:
         st.stop()
 
-    excel_safe = {k: v for k, v in valid.items() if len(v) <= MAX_EXCEL_ROWS}
-    csv_only_keys = [k for k in valid if k not in excel_safe]
+    excel_safe_keys = {k for k, v in file_selections.items() if v[2] <= MAX_EXCEL_ROWS}
+    csv_only_keys = [k for k in file_selections if k not in excel_safe_keys]
     if csv_only_keys:
         st.warning(f"Excluded from Excel (>500k rows, CSV only): {', '.join(csv_only_keys)}")
 
     st.divider()
     if st.button("Convert all", type="primary", use_container_width=True):
         st.session_state.pop("_pq_batch_excel", None)
-        bar = st.progress(0, text="Starting...")
-        for i, name in enumerate(valid):
-            bar.progress(int((i + 1) / len(valid) * 70), text=f"Preparing {name}...")
-        bar.progress(75, text="Writing CSVs...")
-        csv_map = {name: _to_csv(df) for name, df in valid.items()}
-        st.session_state["_pq_batch_csvs"] = csv_map
-        if excel_safe:
-            bar.progress(85, text="Writing Excel...")
-            st.session_state["_pq_batch_excel"] = _to_excel(excel_safe)
-        bar.progress(100, text="Ready.")
+        try:
+            bar = st.progress(0, text="Starting...")
+            frames_excel = {}
+            csv_map = {}
+            total = len(file_selections)
+            for i, (slot, (raw, sel_cols, _)) in enumerate(file_selections.items()):
+                bar.progress(int((i + 1) / total * 70), text=f"Loading {slot}...")
+                df = _read_columns(raw, sel_cols)
+                csv_map[slot] = _to_csv(df)
+                if slot in excel_safe_keys:
+                    frames_excel[slot] = df
+            bar.progress(80, text="Writing CSVs...")
+            st.session_state["_pq_batch_csvs"] = csv_map
+            if frames_excel:
+                bar.progress(88, text="Writing Excel...")
+                st.session_state["_pq_batch_excel"] = _to_excel(frames_excel)
+            bar.progress(100, text="Ready.")
+        except Exception as e:
+            st.error(f"Conversion failed: {e}")
 
     if "_pq_batch_excel" in st.session_state:
         st.download_button(
